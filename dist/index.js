@@ -10,6 +10,10 @@ export function createLoopGuard(options = {}) {
     let history = [];
     let stopped;
     const softWarned = new Set();
+    function addToCost(amount) {
+        if (amount !== undefined && !Number.isNaN(amount))
+            cost += amount;
+    }
     function settle(step, result) {
         const value = fingerprint(normalize(result));
         stale = history.some((other) => other !== step && other.result === value) ? stale + 1 : 0;
@@ -55,26 +59,27 @@ export function createLoopGuard(options = {}) {
         return count >= limit ? "warn" : "continue";
     }
     function stop(code, reason, count) {
-        stopped = verdict("stop", code, reason, count);
+        stopped = Object.freeze(verdict("stop", code, reason, count));
         return stopped;
     }
     function hardLimit(elapsed) {
         if (steps > maxSteps)
             return stop("steps", `Step limit reached (${maxSteps}). Stop and finish with what you have.`);
-        if (elapsed >= maxMs)
-            return stop("time", `Time limit reached (${seconds(maxMs)}). Stop and finish with what you have.`);
-        if (cost >= maxCost)
-            return stop("cost", `Cost limit reached (${cost} of ${maxCost}). Stop and finish with what you have.`);
+        if (Number.isFinite(maxMs) && elapsed >= maxMs)
+            return stop("time", `Time limit reached (${duration(maxMs)}). Stop and finish with what you have.`);
+        if (Number.isFinite(maxCost) && reached(cost, maxCost)) {
+            return stop("cost", `Cost limit reached (${formatNumber(cost)} of ${formatNumber(maxCost)}). Stop and finish with what you have.`);
+        }
         return undefined;
     }
     function softLimit(elapsed) {
         const near = [
             ["steps", steps, maxSteps, `You've used ${steps} of ${maxSteps} steps. Wrap up soon.`],
-            ["time", elapsed, maxMs, `You've used ${seconds(elapsed)} of ${seconds(maxMs)}. Wrap up soon.`],
-            ["cost", cost, maxCost, `You've spent ${cost} of ${maxCost}. Wrap up soon.`],
+            ["time", elapsed, maxMs, `You've used ${duration(elapsed)} of ${duration(maxMs)}. Wrap up soon.`],
+            ["cost", cost, maxCost, `You've spent ${formatNumber(cost)} of ${formatNumber(maxCost)}. Wrap up soon.`],
         ];
         for (const [code, used, limit, reason] of near) {
-            if (softWarned.has(code) || !Number.isFinite(limit) || used < limit * warnAt || warnAt >= 1)
+            if (softWarned.has(code) || !Number.isFinite(limit) || warnAt >= 1 || !reached(used, limit * warnAt))
                 continue;
             softWarned.add(code);
             return verdict("warn", code, reason);
@@ -105,7 +110,7 @@ export function createLoopGuard(options = {}) {
             if (stopped)
                 return stopped;
             steps++;
-            cost += call.cost ?? 0;
+            addToCost(call.cost);
             const step = { key: fingerprint([call.name, call.args]), name: call.name, result: undefined };
             const watched = !ignore.has(call.name);
             if (watched) {
@@ -125,7 +130,7 @@ export function createLoopGuard(options = {}) {
             return found ?? softLimit(elapsed) ?? CONTINUE;
         },
         result(call, result, amount) {
-            cost += amount ?? 0;
+            addToCost(amount);
             const key = fingerprint([call.name, call.args]);
             for (let i = history.length - 1; i >= 0; i--) {
                 const step = history[i];
@@ -134,7 +139,7 @@ export function createLoopGuard(options = {}) {
             }
         },
         addCost(amount) {
-            cost += amount;
+            addToCost(amount);
         },
         stats() {
             return { steps, cost, elapsedMs: now() - started, stopped: stopped !== undefined };
@@ -156,13 +161,19 @@ function verdict(action, code, reason, count) {
 function alike(a, b) {
     return a.key === b.key && (a.result === undefined || b.result === undefined || a.result === b.result);
 }
-function seconds(ms) {
-    return `${Math.round(ms / 1000)}s`;
+function reached(used, limit) {
+    return used + Math.abs(limit) * 1e-12 >= limit;
+}
+function formatNumber(value) {
+    return Number.isFinite(value) ? String(Number(value.toPrecision(12))) : String(value);
+}
+function duration(ms) {
+    return ms < 1000 ? `${Math.round(ms)}ms` : `${Math.round(ms / 1000)}s`;
 }
 function fingerprint(value) {
     return hash(stable(value, new Set()));
 }
-/** JSON-like text with sorted keys, safe for cycles, bigints and errors. */
+/** JSON-like text with sorted keys, safe for cycles, bigints, errors and built-ins. */
 function stable(value, parents) {
     if (typeof value === "string")
         return JSON.stringify(value);
@@ -174,10 +185,31 @@ function stable(value, parents) {
         return `date:${value.getTime()}`;
     if (value instanceof Error)
         return `error:${value.name}:${value.message}`;
+    if (value instanceof RegExp)
+        return `regexp:${value.source}/${value.flags}`;
+    if (value instanceof URL)
+        return `url:${value.href}`;
+    if (value instanceof ArrayBuffer)
+        return `bytes:${new Uint8Array(value).join(",")}`;
+    if (ArrayBuffer.isView(value)) {
+        const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        return `bytes:${value.constructor.name}:${bytes.join(",")}`;
+    }
     parents.add(value);
-    const text = Array.isArray(value)
-        ? `[${value.map((item) => stable(item, parents)).join(",")}]`
-        : `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key], parents)}`).join(",")}}`;
+    let text;
+    if (Array.isArray(value)) {
+        text = `[${value.map((item) => stable(item, parents)).join(",")}]`;
+    }
+    else if (value instanceof Set) {
+        text = `set:[${Array.from(value, (item) => stable(item, parents)).sort().join(",")}]`;
+    }
+    else if (value instanceof Map) {
+        const entries = Array.from(value.entries(), ([k, v]) => `${stable(k, parents)}=>${stable(v, parents)}`).sort();
+        text = `map:{${entries.join(",")}}`;
+    }
+    else {
+        text = `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key], parents)}`).join(",")}}`;
+    }
     parents.delete(value);
     return text;
 }

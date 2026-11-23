@@ -161,12 +161,44 @@ describe("hard limits", () => {
     assert.equal(guard.check(search("b")).code, "time");
   });
 
+  it("formats sub-second time limits in milliseconds", () => {
+    let clock = 0;
+    const guard = createLoopGuard({ maxMs: 500, now: () => clock });
+    clock = 400;
+    const warned = guard.check(search("a"));
+    assert.equal(warned.action, "warn");
+    assert.match(warned.reason, /400ms of 500ms/);
+    clock = 500;
+    const stopped = guard.check(search("b"));
+    assert.equal(stopped.action, "stop");
+    assert.match(stopped.reason, /500ms/);
+  });
+
   it("stops at maxCost across every way of adding cost", () => {
     const guard = createLoopGuard({ maxCost: 1, warnAt: 1 });
     assert.equal(guard.check({ ...search("a"), cost: 0.25 }).action, "continue");
     guard.result(search("a"), "x", 0.25);
     guard.addCost(0.25);
     assert.equal(guard.check({ ...search("b"), cost: 0.25 }).code, "cost");
+  });
+
+  it("handles floating-point cost accumulation cleanly", () => {
+    const guard = createLoopGuard({ maxCost: 1, warnAt: 0.8 });
+    const verdicts = Array.from({ length: 10 }, (_, i) => guard.check({ name: `t${i}`, cost: 0.1 }));
+    assert.equal(verdicts[7]!.action, "warn");
+    assert.equal(verdicts[7]!.code, "cost");
+    assert.match(verdicts[7]!.reason, /0\.8 of 1/);
+    assert.equal(verdicts[9]!.action, "stop");
+    assert.equal(verdicts[9]!.code, "cost");
+    assert.match(verdicts[9]!.reason, /1 of 1/);
+  });
+
+  it("ignores NaN costs instead of disabling maxCost", () => {
+    const guard = createLoopGuard({ maxCost: 1, warnAt: 1 });
+    guard.addCost(Number.NaN);
+    assert.equal(guard.check({ ...search("a"), cost: Number.NaN }).action, "continue");
+    guard.result(search("a"), "x", Number.NaN);
+    assert.equal(guard.check({ ...search("b"), cost: 1 }).code, "cost");
   });
 
   it("warns about each limit only once", () => {
@@ -183,6 +215,7 @@ describe("guard", () => {
     guard.check(search("a"));
     const first = guard.check(search("b"));
     assert.equal(first.action, "stop");
+    assert.equal(Object.isFrozen(first), true);
     assert.equal(guard.check(search("c")), first);
     assert.equal(guard.stats().steps, 2);
     assert.equal(guard.stats().stopped, true);
@@ -209,6 +242,31 @@ describe("guard", () => {
     circular.self = circular;
     guard.check({ name: "t", args: circular });
     assert.equal(guard.check({ name: "t", args: circular }).action, "stop");
+  });
+
+  it("distinguishes Map, Set, RegExp, URL and binary arguments", () => {
+    const guard = createLoopGuard({ maxRepeats: 2, warnings: 0 });
+    assert.equal(guard.check({ name: "t", args: new Map([["a", 1]]) }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: new Map([["b", 2]]) }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: new Set([1, 2]) }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: new Set([3, 4]) }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: /foo/g }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: /bar/i }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: new URL("https://example.com/a") }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: new URL("https://example.com/b") }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: new Uint8Array([1, 2]) }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: new Uint8Array([1, 3]) }).action, "continue");
+    assert.equal(guard.check({ name: "t", args: {} }).action, "continue");
+  });
+
+  it("matches equal Map and Set values regardless of insertion order", () => {
+    const guard = createLoopGuard({ maxRepeats: 2, warnings: 0 });
+    guard.check({ name: "m", args: new Map([["a", 1], ["b", 2]]) });
+    assert.equal(guard.check({ name: "m", args: new Map([["b", 2], ["a", 1]]) }).action, "stop");
+
+    guard.reset();
+    guard.check({ name: "s", args: new Set([1, 2]) });
+    assert.equal(guard.check({ name: "s", args: new Set([2, 1]) }).action, "stop");
   });
 
   it("tells 1 from '1'", () => {
